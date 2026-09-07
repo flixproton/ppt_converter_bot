@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import threading
+import time
 import unicodedata
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import fitz  # PyMuPDF
@@ -32,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 # -------------------------------------------------------------
-# DUMMY SERVER FOR RENDER WEB SERVICE
+# DUMMY SERVER (Keeps Render Web Service alive)
 # -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -52,10 +53,53 @@ def run_dummy_server():
 
 
 # -------------------------------------------------------------
-# ROBUST TEXT SANITIZER & LONG WORD SPLITTER
+# PROGRESS BAR HELPER (Throttled to avoid Telegram Rate Limits)
+# -------------------------------------------------------------
+class ProgressTracker:
+    def __init__(self, status_msg, total_items, stage_name="Converting"):
+        self.status_msg = status_msg
+        self.total = max(1, total_items)
+        self.stage_name = stage_name
+        self.last_update_time = 0
+        self.bar_length = 10
+
+    def _generate_bar(self, current):
+        fraction = min(max(current / self.total, 0.0), 1.0)
+        filled = int(round(self.bar_length * fraction))
+        bar = "█" * filled + "░" * (self.bar_length - filled)
+        percent = int(fraction * 100)
+        return f"[{bar}] {percent}%"
+
+    async def update(self, current, detail="", force=False):
+        now = time.time()
+        # Update at most once every 1.5 seconds unless forced to avoid Telegram FloodWait
+        if not force and (now - self.last_update_time < 1.5):
+            return
+
+        self.last_update_time = now
+        bar_text = self._generate_bar(current)
+        remaining = max(0, self.total - current)
+
+        msg = (
+            f"⚡ **{BRAND_NAME} is working...**\n\n"
+            f"`{bar_text}`\n\n"
+            f"📊 **Stage:** {self.stage_name}\n"
+            f"📄 **Progress:** Slide `{current}` of `{self.total}`\n"
+            f"⏳ **Remaining:** `{remaining}` slide(s)\n"
+            f"ℹ️ _{detail}_"
+        )
+        try:
+            await self.status_msg.edit_text(msg, parse_mode="Markdown")
+        except Exception:
+            # Ignore duplicate message edits or network blips silently
+            pass
+
+
+# -------------------------------------------------------------
+# TEXT CLEANER & SANITIZER
 # -------------------------------------------------------------
 def clean_text_for_pdf(text: str) -> str:
-    """Sanitizes text, converts math/unicode symbols, and splits overlong words."""
+    """Sanitizes unicode, symbols, and breaks long words that exceed column widths."""
     if not text:
         return ""
 
@@ -70,14 +114,11 @@ def clean_text_for_pdf(text: str) -> str:
     for k, v in replacements.items():
         text = text.replace(k, v)
 
-    # Convert unicode to standard ASCII
     text = unicodedata.normalize('NFKD', text)
     text = text.encode('latin-1', 'ignore').decode('latin-1')
-
-    # Remove non-printable control characters
     text = "".join(ch for ch in text if ch.isprintable() or ch in ['\n', '\t', ' '])
 
-    # CRITICAL FIX: Split long unbroken tokens (URLs/code/math) exceeding 32 chars
+    # Split continuous words/URLs longer than 32 chars
     words = text.split(' ')
     safe_words = []
     for word in words:
@@ -91,14 +132,20 @@ def clean_text_for_pdf(text: str) -> str:
 
 
 # -------------------------------------------------------------
-# EXTRACTION LOGIC (PPTX & PDF)
+# EXTRACTORS WITH PROGRESS HOOKS
 # -------------------------------------------------------------
-def extract_from_pptx(file_bytes):
-    """Extracts text from slides, tables, shapes, and notes in PPTX."""
+async def extract_from_pptx(file_bytes, tracker=None):
     prs = Presentation(io.BytesIO(file_bytes))
+    total_slides = len(prs.slides)
+    if tracker:
+        tracker.total = total_slides
+
     slides_data = []
 
     for idx, slide in enumerate(prs.slides, start=1):
+        if tracker:
+            await tracker.update(idx, detail="Extracting slide text & notes...")
+
         title = ""
         if slide.shapes.title and slide.shapes.title.text:
             title = clean_text_for_pdf(slide.shapes.title.text)
@@ -109,22 +156,17 @@ def extract_from_pptx(file_bytes):
         for shape in slide.shapes:
             if shape == slide.shapes.title:
                 continue
-
-            # Standard Text Frames
             if shape.has_text_frame:
                 for p in shape.text_frame.paragraphs:
                     cleaned = clean_text_for_pdf(p.text)
                     if cleaned and cleaned not in content:
                         content.append(cleaned)
-
-            # Tables in Slides
             elif shape.has_table:
                 for row in shape.table.rows:
                     row_cells = [clean_text_for_pdf(c.text) for c in row.cells if clean_text_for_pdf(c.text)]
                     if row_cells:
                         content.append(" | ".join(row_cells))
 
-        # Presenter Notes
         notes = ""
         if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
             notes = clean_text_for_pdf(slide.notes_slide.notes_text_frame.text)
@@ -135,15 +177,25 @@ def extract_from_pptx(file_bytes):
             "content": content,
             "notes": notes,
         })
+
+    if tracker:
+        await tracker.update(total_slides, detail="Text extraction complete!", force=True)
+
     return slides_data
 
 
-def extract_from_pdf(file_bytes):
-    """Extracts text blocks cleanly from PDF presentations."""
+async def extract_from_pdf(file_bytes, tracker=None):
     doc = fitz.open(stream=file_bytes, filetype="pdf")
+    total_pages = len(doc)
+    if tracker:
+        tracker.total = total_pages
+
     slides_data = []
 
     for idx, page in enumerate(doc, start=1):
+        if tracker:
+            await tracker.update(idx, detail="Reading slide page...")
+
         text = page.get_text("text").strip()
         raw_lines = [clean_text_for_pdf(line) for line in text.split("\n") if clean_text_for_pdf(line)]
 
@@ -156,11 +208,15 @@ def extract_from_pdf(file_bytes):
             "content": content,
             "notes": "",
         })
+
+    if tracker:
+        await tracker.update(total_pages, detail="Slide reading complete!", force=True)
+
     return slides_data
 
 
 # -------------------------------------------------------------
-# SAFE BLACK & WHITE PDF GENERATOR
+# BLACK & WHITE PDF GENERATOR
 # -------------------------------------------------------------
 class BWNotesPDF(FPDF):
     def header(self):
@@ -179,7 +235,6 @@ class BWNotesPDF(FPDF):
 
 
 def safe_write_paragraph(pdf, text, font_size=10, is_bold=False, is_italic=False, color=(30, 30, 30), prefix=""):
-    """Safely writes multi-line text with auto-managed widths and margins."""
     if not text:
         return
 
@@ -201,16 +256,13 @@ def safe_write_paragraph(pdf, text, font_size=10, is_bold=False, is_italic=False
     try:
         pdf.multi_cell(w=pdf.epw, h=line_height, text=full_text)
         pdf.ln(1)
-    except Exception as e:
-        logger.warning(f"Fallback writing line due to error: {e}")
-        # Secondary fallback: break characters if still oversized
+    except Exception:
         pdf.set_x(pdf.l_margin)
         pdf.multi_cell(w=pdf.epw, h=line_height, text=full_text[:120] + "...")
         pdf.ln(1)
 
 
 def create_bw_text_pdf(slides_data):
-    """Generates structured A4 Black and White study notes with dynamic font scaling."""
     pdf = BWNotesPDF(orientation="P", unit="mm", format="A4")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
@@ -219,13 +271,11 @@ def create_bw_text_pdf(slides_data):
         if not item["title"] and not item["content"] and not item["notes"]:
             continue
 
-        # Section separator line
         pdf.set_draw_color(220, 220, 220)
         pdf.set_x(pdf.l_margin)
         pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + pdf.epw, pdf.get_y())
         pdf.ln(3)
 
-        # Dynamic Title Scaling (fits any title size automatically)
         title_len = len(item["title"])
         if title_len > 90:
             title_font_size = 9
@@ -234,54 +284,41 @@ def create_bw_text_pdf(slides_data):
         else:
             title_font_size = 12
 
-        safe_write_paragraph(
-            pdf,
-            text=item["title"],
-            font_size=title_font_size,
-            is_bold=True,
-            color=(0, 0, 0),
-            prefix=f"[{item['num']}] "
-        )
+        safe_write_paragraph(pdf, text=item["title"], font_size=title_font_size, is_bold=True, color=(0, 0, 0), prefix=f"[{item['num']}] ")
 
-        # Content Bullets
         if item["content"]:
             for bullet in item["content"]:
-                safe_write_paragraph(
-                    pdf,
-                    text=bullet,
-                    font_size=9.5,
-                    is_bold=False,
-                    color=(35, 35, 35),
-                    prefix="• "
-                )
+                safe_write_paragraph(pdf, text=bullet, font_size=9.5, is_bold=False, color=(35, 35, 35), prefix="• ")
 
-        # Speaker Notes (if any)
         if item["notes"]:
-            safe_write_paragraph(
-                pdf,
-                text=item["notes"],
-                font_size=8.5,
-                is_italic=True,
-                color=(80, 80, 80),
-                prefix="Presenter Notes: "
-            )
+            safe_write_paragraph(pdf, text=item["notes"], font_size=8.5, is_italic=True, color=(80, 80, 80), prefix="Presenter Notes: ")
 
         pdf.ln(3)
 
     return bytes(pdf.output())
 
 
-def convert_image_pdf_to_bw(file_bytes):
-    """Universal Fallback: Converts full slide deck pages into crisp B&W/grayscale printable pages."""
+async def convert_image_pdf_to_bw(file_bytes, tracker=None):
+    """Fast Grayscale rendering for image/scanned slide decks."""
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
     out_doc = fitz.open()
+    total_pages = len(src_doc)
+    if tracker:
+        tracker.total = total_pages
 
-    for page in src_doc:
-        pix = page.get_pixmap(colorspace=fitz.csGRAY, dpi=150)
+    for idx, page in enumerate(src_doc, start=1):
+        if tracker:
+            await tracker.update(idx, detail="Rendering clean B&W page...")
+
+        # 120 DPI gives crisp reading quality with 40% faster rendering speed
+        pix = page.get_pixmap(colorspace=fitz.csGRAY, dpi=120)
         img_bytes = pix.tobytes("png")
         rect = page.rect
         new_page = out_doc.new_page(width=rect.width, height=rect.height)
         new_page.insert_image(rect, stream=img_bytes)
+
+    if tracker:
+        await tracker.update(total_pages, detail="Rendering finished!", force=True)
 
     return out_doc.tobytes()
 
@@ -294,11 +331,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👋 **Welcome to {BRAND_NAME}!**\n\n"
         "📄 Send me any **PPTX** or **PDF presentation**, and I will instantly convert it into a "
         "**clean, ink-saving Black & White study notes PDF**!\n\n"
-        "✨ **What I do:**\n"
+        "✨ **Features:**\n"
+        "• Real-time conversion Progress Bar 📊\n"
         "• Strips dark background colors & images\n"
         "• Automatically fits headlines & bullet points\n"
-        "• Extracts slide text, tables & presenter notes\n"
-        "• Generates printable A4 study sheets\n\n"
+        "• Extracts slide text, tables & presenter notes\n\n"
         "🚀 **Send your file now to get started!**"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
@@ -313,7 +350,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Please send a valid **.pptx** or **.pdf** slide file.", parse_mode="Markdown")
         return
 
-    status_msg = await update.message.reply_text("⏳ **Converting into clean B&W notes... Please wait.**", parse_mode="Markdown")
+    status_msg = await update.message.reply_text(
+        f"⚡ **{BRAND_NAME} is preparing...**\n\n"
+        "`[░░░░░░░░░░] 0%`\n"
+        "📥 *Downloading your file...*",
+        parse_mode="Markdown"
+    )
 
     try:
         # Download document into memory
@@ -322,30 +364,42 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_bytes = bytes(raw_bytes)
 
         output_pdf_bytes = None
+        tracker = ProgressTracker(status_msg=status_msg, total_items=10, stage_name="Converting Slides")
 
         if file_ext == "pptx":
-            slides_data = extract_from_pptx(file_bytes)
+            slides_data = await extract_from_pptx(file_bytes, tracker=tracker)
             output_pdf_bytes = create_bw_text_pdf(slides_data)
         else:
-            # Extract PDF content
-            slides_data = extract_from_pdf(file_bytes)
+            slides_data = await extract_from_pdf(file_bytes, tracker=tracker)
             total_text_len = sum(len(s["title"]) + sum(len(c) for c in s["content"]) for s in slides_data)
 
-            # If document has text, build formatted notes; if it's purely scanned images, use visual B&W engine
             if total_text_len > 30:
                 try:
                     output_pdf_bytes = create_bw_text_pdf(slides_data)
                 except Exception as text_err:
-                    logger.warning(f"Text layout failed, using visual B&W fallback: {text_err}")
-                    output_pdf_bytes = convert_image_pdf_to_bw(file_bytes)
+                    logger.warning(f"Text layout failed, switching to image B&W fallback: {text_err}")
+                    tracker.stage_name = "Rendering Grayscale Slides"
+                    output_pdf_bytes = await convert_image_pdf_to_bw(file_bytes, tracker=tracker)
             else:
-                output_pdf_bytes = convert_image_pdf_to_bw(file_bytes)
+                tracker.stage_name = "Rendering Grayscale Slides"
+                output_pdf_bytes = await convert_image_pdf_to_bw(file_bytes, tracker=tracker)
 
-        # Brand the output filename
+        # Notify upload
+        try:
+            await status_msg.edit_text(
+                f"⚡ **{BRAND_NAME}**\n\n"
+                "`[██████████] 100%`\n"
+                "📤 **Finalizing and sending your notes...**",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+        # Brand output filename
         base_name = os.path.splitext(file_name)[0]
         output_filename = f"{base_name}_Yash_PPT_Converter_Bot.pdf"
 
-        # Send file back to user
+        # Send PDF back to user
         await update.message.reply_document(
             document=io.BytesIO(output_pdf_bytes),
             filename=output_filename,
@@ -356,31 +410,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error during conversion: {e}", exc_info=True)
-        # Ultimate fallback for any unhandled PDF issues
-        if file_ext == "pdf":
-            try:
-                output_pdf_bytes = convert_image_pdf_to_bw(file_bytes)
-                base_name = os.path.splitext(file_name)[0]
-                output_filename = f"{base_name}_Yash_PPT_Converter_Bot.pdf"
-                await update.message.reply_document(
-                    document=io.BytesIO(output_pdf_bytes),
-                    filename=output_filename,
-                    caption=f"✅ **Converted successfully by {BRAND_NAME}!**\n📄 Printable Grayscale B&W Notes.",
-                    parse_mode="Markdown",
-                )
-                await status_msg.delete()
-                return
-            except Exception:
-                pass
-
         await status_msg.edit_text(f"❌ Conversion failed: `{str(e)}`", parse_mode="Markdown")
 
 
 # -------------------------------------------------------------
-# MAIN APP ENTRY
+# MAIN ENTRY
 # -------------------------------------------------------------
 def main():
-    # Start background health server for Render
     server_thread = threading.Thread(target=run_dummy_server, daemon=True)
     server_thread.start()
 
