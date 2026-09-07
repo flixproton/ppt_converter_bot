@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 
 
 # -------------------------------------------------------------
-# DUMMY SERVER (Keeps Render Web Service alive)
+# DUMMY SERVER FOR RENDER HEALTH CHECKS
 # -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -53,7 +53,44 @@ def run_dummy_server():
 
 
 # -------------------------------------------------------------
-# PROGRESS BAR HELPER (Throttled to avoid Telegram Rate Limits)
+# 100% PURE ASCII SANITIZER (CRITICAL FIX FOR FONT ERRORS)
+# -------------------------------------------------------------
+def clean_text_for_pdf(text: str) -> str:
+    """Converts unicode symbols, math, bullets, quotes into pure ASCII text."""
+    if not text:
+        return ""
+
+    replacements = {
+        '“': '"', '”': '"', '‘': "'", '’': "'",
+        '—': '-', '–': '-', '…': '...', '•': '-',
+        '▪': '-', '►': '>', '✔': '/', '✓': '/',
+        '→': '->', '←': '<-', '⇒': '=>', '≤': '<=', '≥': '>=',
+        '≠': '!=', '±': '+/-', '×': 'x', '÷': '/', '°': ' deg ',
+        '\u200b': '', '\ufeff': '', '\xa0': ' ', '\r': ''
+    }
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+
+    # Normalize and convert entirely to safe ASCII characters
+    text = unicodedata.normalize('NFKD', text)
+    text = text.encode('ascii', 'ignore').decode('ascii')
+    text = "".join(ch for ch in text if ch.isprintable() or ch in ['\n', '\t', ' '])
+
+    # Split continuous words/URLs longer than 30 characters
+    words = text.split(' ')
+    safe_words = []
+    for word in words:
+        if len(word) > 30:
+            chunks = [word[i:i+28] for i in range(0, len(word), 28)]
+            safe_words.append(" ".join(chunks))
+        else:
+            safe_words.append(word)
+
+    return " ".join(safe_words).strip()
+
+
+# -------------------------------------------------------------
+# PROGRESS TRACKER (THROTTLED)
 # -------------------------------------------------------------
 class ProgressTracker:
     def __init__(self, status_msg, total_items, stage_name="Converting"):
@@ -72,7 +109,6 @@ class ProgressTracker:
 
     async def update(self, current, detail="", force=False):
         now = time.time()
-        # Update at most once every 1.5 seconds unless forced to avoid Telegram FloodWait
         if not force and (now - self.last_update_time < 1.5):
             return
 
@@ -81,7 +117,7 @@ class ProgressTracker:
         remaining = max(0, self.total - current)
 
         msg = (
-            f"⚡ **{BRAND_NAME} is working...**\n\n"
+            f"⚡ **{BRAND_NAME} is converting...**\n\n"
             f"`{bar_text}`\n\n"
             f"📊 **Stage:** {self.stage_name}\n"
             f"📄 **Progress:** Slide `{current}` of `{self.total}`\n"
@@ -91,48 +127,11 @@ class ProgressTracker:
         try:
             await self.status_msg.edit_text(msg, parse_mode="Markdown")
         except Exception:
-            # Ignore duplicate message edits or network blips silently
             pass
 
 
 # -------------------------------------------------------------
-# TEXT CLEANER & SANITIZER
-# -------------------------------------------------------------
-def clean_text_for_pdf(text: str) -> str:
-    """Sanitizes unicode, symbols, and breaks long words that exceed column widths."""
-    if not text:
-        return ""
-
-    replacements = {
-        '“': '"', '”': '"', '‘': "'", '’': "'",
-        '—': '-', '–': '-', '…': '...', '•': '*',
-        '▪': '*', '►': '>', '✔': '/', '✓': '/',
-        '→': '->', '←': '<-', '⇒': '=>', '≤': '<=', '≥': '>=',
-        '≠': '!=', '±': '+/-', '×': 'x', '÷': '/', '°': ' deg ',
-        '\u200b': '', '\ufeff': '', '\xa0': ' ', '\r': ''
-    }
-    for k, v in replacements.items():
-        text = text.replace(k, v)
-
-    text = unicodedata.normalize('NFKD', text)
-    text = text.encode('latin-1', 'ignore').decode('latin-1')
-    text = "".join(ch for ch in text if ch.isprintable() or ch in ['\n', '\t', ' '])
-
-    # Split continuous words/URLs longer than 32 chars
-    words = text.split(' ')
-    safe_words = []
-    for word in words:
-        if len(word) > 32:
-            chunks = [word[i:i+30] for i in range(0, len(word), 30)]
-            safe_words.append(" ".join(chunks))
-        else:
-            safe_words.append(word)
-
-    return " ".join(safe_words).strip()
-
-
-# -------------------------------------------------------------
-# EXTRACTORS WITH PROGRESS HOOKS
+# EXTRACTORS
 # -------------------------------------------------------------
 async def extract_from_pptx(file_bytes, tracker=None):
     prs = Presentation(io.BytesIO(file_bytes))
@@ -179,7 +178,7 @@ async def extract_from_pptx(file_bytes, tracker=None):
         })
 
     if tracker:
-        await tracker.update(total_slides, detail="Text extraction complete!", force=True)
+        await tracker.update(total_slides, detail="Extraction complete!", force=True)
 
     return slides_data
 
@@ -194,7 +193,7 @@ async def extract_from_pdf(file_bytes, tracker=None):
 
     for idx, page in enumerate(doc, start=1):
         if tracker:
-            await tracker.update(idx, detail="Reading slide page...")
+            await tracker.update(idx, detail="Reading slide text...")
 
         text = page.get_text("text").strip()
         raw_lines = [clean_text_for_pdf(line) for line in text.split("\n") if clean_text_for_pdf(line)]
@@ -216,14 +215,15 @@ async def extract_from_pdf(file_bytes, tracker=None):
 
 
 # -------------------------------------------------------------
-# BLACK & WHITE PDF GENERATOR
+# BLACK & WHITE PDF BUILDER
 # -------------------------------------------------------------
 class BWNotesPDF(FPDF):
     def header(self):
         self.set_x(self.l_margin)
         self.set_font("Helvetica", "B", 9)
         self.set_text_color(100, 100, 100)
-        self.cell(self.epw, 6, f"Study Notes • {BRAND_NAME}", border=0, align="R")
+        # Safe ASCII header without non-standard bullets
+        self.cell(self.epw, 6, clean_text_for_pdf(f"Study Notes | {BRAND_NAME}"), border=0, align="R")
         self.ln(8)
 
     def footer(self):
@@ -231,34 +231,28 @@ class BWNotesPDF(FPDF):
         self.set_x(self.l_margin)
         self.set_font("Helvetica", "I", 8)
         self.set_text_color(120, 120, 120)
-        self.cell(self.epw, 8, f"Page {self.page_no()} | Generated by {BRAND_NAME}", align="C")
+        self.cell(self.epw, 8, clean_text_for_pdf(f"Page {self.page_no()} | Generated by {BRAND_NAME}"), align="C")
 
 
 def safe_write_paragraph(pdf, text, font_size=10, is_bold=False, is_italic=False, color=(30, 30, 30), prefix=""):
     if not text:
         return
 
-    style = ""
-    if is_bold and is_italic:
-        style = "BI"
-    elif is_bold:
-        style = "B"
-    elif is_italic:
-        style = "I"
-
+    style = "B" if is_bold else ("I" if is_italic else "")
     pdf.set_font("Helvetica", style, font_size)
     pdf.set_text_color(*color)
     pdf.set_x(pdf.l_margin)
 
-    full_text = f"{prefix}{text}"
+    full_text = clean_text_for_pdf(f"{prefix}{text}")
     line_height = max(4.5, font_size * 0.45)
 
     try:
         pdf.multi_cell(w=pdf.epw, h=line_height, text=full_text)
         pdf.ln(1)
-    except Exception:
+    except Exception as e:
+        logger.warning(f"Line write issue: {e}")
         pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(w=pdf.epw, h=line_height, text=full_text[:120] + "...")
+        pdf.multi_cell(w=pdf.epw, h=line_height, text=full_text[:80])
         pdf.ln(1)
 
 
@@ -276,19 +270,16 @@ def create_bw_text_pdf(slides_data):
         pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + pdf.epw, pdf.get_y())
         pdf.ln(3)
 
+        # Dynamic title scaling
         title_len = len(item["title"])
-        if title_len > 90:
-            title_font_size = 9
-        elif title_len > 45:
-            title_font_size = 10.5
-        else:
-            title_font_size = 12
+        title_font_size = 9 if title_len > 90 else (10.5 if title_len > 45 else 12)
 
         safe_write_paragraph(pdf, text=item["title"], font_size=title_font_size, is_bold=True, color=(0, 0, 0), prefix=f"[{item['num']}] ")
 
         if item["content"]:
             for bullet in item["content"]:
-                safe_write_paragraph(pdf, text=bullet, font_size=9.5, is_bold=False, color=(35, 35, 35), prefix="• ")
+                # Using ASCII dash '-' instead of unicode bullet '•'
+                safe_write_paragraph(pdf, text=bullet, font_size=9.5, is_bold=False, color=(35, 35, 35), prefix="- ")
 
         if item["notes"]:
             safe_write_paragraph(pdf, text=item["notes"], font_size=8.5, is_italic=True, color=(80, 80, 80), prefix="Presenter Notes: ")
@@ -299,7 +290,7 @@ def create_bw_text_pdf(slides_data):
 
 
 async def convert_image_pdf_to_bw(file_bytes, tracker=None):
-    """Fast Grayscale rendering for image/scanned slide decks."""
+    """Fallback: Generates lightweight compressed B&W JPEG pages (< 5MB)."""
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
     out_doc = fitz.open()
     total_pages = len(src_doc)
@@ -308,19 +299,20 @@ async def convert_image_pdf_to_bw(file_bytes, tracker=None):
 
     for idx, page in enumerate(src_doc, start=1):
         if tracker:
-            await tracker.update(idx, detail="Rendering clean B&W page...")
+            await tracker.update(idx, detail="Rendering compressed B&W page...")
 
-        # 120 DPI gives crisp reading quality with 40% faster rendering speed
-        pix = page.get_pixmap(colorspace=fitz.csGRAY, dpi=120)
-        img_bytes = pix.tobytes("png")
+        # 96 DPI JPEG grayscale compression keeps the file under 5MB
+        pix = page.get_pixmap(colorspace=fitz.csGRAY, dpi=96)
+        img_bytes = pix.tobytes("jpeg", jpg_quality=60)
         rect = page.rect
         new_page = out_doc.new_page(width=rect.width, height=rect.height)
         new_page.insert_image(rect, stream=img_bytes)
 
     if tracker:
-        await tracker.update(total_pages, detail="Rendering finished!", force=True)
+        await tracker.update(total_pages, detail="Rendering complete!", force=True)
 
-    return out_doc.tobytes()
+    # Deflate compresses the internal PDF structure
+    return out_doc.tobytes(garbage=4, deflate=True)
 
 
 # -------------------------------------------------------------
@@ -358,7 +350,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        # Download document into memory
         tg_file = await context.bot.get_file(document.file_id)
         raw_bytes = await tg_file.download_as_bytearray()
         file_bytes = bytes(raw_bytes)
@@ -377,14 +368,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     output_pdf_bytes = create_bw_text_pdf(slides_data)
                 except Exception as text_err:
-                    logger.warning(f"Text layout failed, switching to image B&W fallback: {text_err}")
+                    logger.warning(f"Text layout failed, switching to compressed image fallback: {text_err}")
                     tracker.stage_name = "Rendering Grayscale Slides"
                     output_pdf_bytes = await convert_image_pdf_to_bw(file_bytes, tracker=tracker)
             else:
                 tracker.stage_name = "Rendering Grayscale Slides"
                 output_pdf_bytes = await convert_image_pdf_to_bw(file_bytes, tracker=tracker)
 
-        # Notify upload
         try:
             await status_msg.edit_text(
                 f"⚡ **{BRAND_NAME}**\n\n"
@@ -395,11 +385,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        # Brand output filename
         base_name = os.path.splitext(file_name)[0]
         output_filename = f"{base_name}_Yash_PPT_Converter_Bot.pdf"
 
-        # Send PDF back to user
         await update.message.reply_document(
             document=io.BytesIO(output_pdf_bytes),
             filename=output_filename,
