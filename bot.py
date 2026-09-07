@@ -33,14 +33,14 @@ logger = logging.getLogger(__name__)
 
 
 # -------------------------------------------------------------
-# DUMMY SERVER FOR RENDER HEALTH CHECKS
+# DUMMY SERVER FOR RENDER
 # -------------------------------------------------------------
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(f"{BRAND_NAME} is active and running!".encode("utf-8"))
+        self.wfile.write(f"{BRAND_NAME} is active!".encode("utf-8"))
 
     def log_message(self, format, *args):
         return
@@ -48,15 +48,15 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
 
 def run_dummy_server():
     server = HTTPServer(("0.0.0.0", PORT), HealthCheckHandler)
-    logger.info(f"Dummy health check server running on port {PORT}")
+    logger.info(f"Health check server running on port {PORT}")
     server.serve_forever()
 
 
 # -------------------------------------------------------------
-# 100% PURE ASCII SANITIZER (CRITICAL FIX FOR FONT ERRORS)
+# TEXT SANITIZER & SYMBOL MAPPER
 # -------------------------------------------------------------
 def clean_text_for_pdf(text: str) -> str:
-    """Converts unicode symbols, math, bullets, quotes into pure ASCII text."""
+    """Cleans symbols, normalizes to ASCII, and breaks overly long tokens."""
     if not text:
         return ""
 
@@ -71,16 +71,15 @@ def clean_text_for_pdf(text: str) -> str:
     for k, v in replacements.items():
         text = text.replace(k, v)
 
-    # Normalize and convert entirely to safe ASCII characters
     text = unicodedata.normalize('NFKD', text)
     text = text.encode('ascii', 'ignore').decode('ascii')
     text = "".join(ch for ch in text if ch.isprintable() or ch in ['\n', '\t', ' '])
 
-    # Split continuous words/URLs longer than 30 characters
+    # Split long unbroken URLs or code blocks > 32 chars
     words = text.split(' ')
     safe_words = []
     for word in words:
-        if len(word) > 30:
+        if len(word) > 32:
             chunks = [word[i:i+28] for i in range(0, len(word), 28)]
             safe_words.append(" ".join(chunks))
         else:
@@ -90,7 +89,7 @@ def clean_text_for_pdf(text: str) -> str:
 
 
 # -------------------------------------------------------------
-# PROGRESS TRACKER (THROTTLED)
+# PROGRESS TRACKER
 # -------------------------------------------------------------
 class ProgressTracker:
     def __init__(self, status_msg, total_items, stage_name="Converting"):
@@ -131,7 +130,130 @@ class ProgressTracker:
 
 
 # -------------------------------------------------------------
-# EXTRACTORS
+# INTELLIGENT PDF SLIDE PARSER (Fixes Timelines & Definitions)
+# -------------------------------------------------------------
+def parse_pdf_slide(page, page_num):
+    """Scans bounding boxes, pairs timeline items, unifies paragraphs, and removes slide number noise."""
+    page_dict = page.get_text("dict")
+    page_height = page.rect.height
+
+    raw_items = []
+    for b in page_dict.get("blocks", []):
+        if b.get("type") != 0:  # text blocks only
+            continue
+        for l in b.get("lines", []):
+            line_text = ""
+            max_size = 0
+            x0, y0, x1, y1 = l.get("bbox", (0, 0, 0, 0))
+            for s in l.get("spans", []):
+                t = clean_text_for_pdf(s.get("text", ""))
+                if t:
+                    line_text += (" " if line_text else "") + t
+                    max_size = max(max_size, s.get("size", 10))
+
+            if not line_text:
+                continue
+
+            # Remove slide numbers / page stamps at top or bottom corners
+            if re.match(r'^\d{1,3}$', line_text) and (y0 > page_height * 0.78 or y0 < page_height * 0.15):
+                continue
+            if re.match(r'^(page\s*)?\d{1,3}(\s*/\s*\d{1,3})?$', line_text, re.IGNORECASE):
+                continue
+
+            raw_items.append({
+                "text": line_text,
+                "x0": x0,
+                "y0": y0,
+                "x1": x1,
+                "y1": y1,
+                "size": max_size
+            })
+
+    if not raw_items:
+        return {"num": page_num, "title": f"Slide {page_num}", "elements": [], "notes": ""}
+
+    # 1. Identify Title (top banner or largest font size)
+    top_candidates = [it for it in raw_items if it["y0"] < page_height * 0.28]
+    if top_candidates:
+        title_item = max(top_candidates, key=lambda it: (it["size"], -it["y0"]))
+    else:
+        title_item = max(raw_items, key=lambda it: it["size"])
+
+    title_text = title_item["text"]
+    content_items = [it for it in raw_items if it != title_item]
+
+    # 2. Group horizontally aligned boxes (TIMELINE & KEY-VALUE PAIRS like "1950" and "Turing test")
+    content_items.sort(key=lambda it: (it["y0"], it["x0"]))
+    rows = []
+    for it in content_items:
+        matched_row = None
+        for row in rows:
+            avg_y = sum(r["y0"] for r in row) / len(row)
+            if abs(it["y0"] - avg_y) <= 14:  # Horizontal alignment tolerance
+                matched_row = row
+                break
+        if matched_row is not None:
+            matched_row.append(it)
+        else:
+            rows.append([it])
+
+    # 3. Categorize into Paragraphs vs Bullets vs Timelines
+    formatted_elements = []
+    for row in rows:
+        row.sort(key=lambda it: it["x0"])
+        if len(row) > 1:
+            # Timeline / Table Row: "1950 : Turing test"
+            row_texts = [r["text"].lstrip("-*> \t") for r in row]
+            combined = " : ".join(row_texts)
+            formatted_elements.append(("bullet", combined))
+        else:
+            txt = row[0]["text"]
+            if txt.startswith(("-", "*", ">")) or re.match(r'^\d+[\.\)]\s', txt):
+                formatted_elements.append(("bullet", txt.lstrip("-*> \t")))
+            else:
+                formatted_elements.append(("paragraph", txt))
+
+    # 4. Stitch broken sentences into continuous paragraphs (Fixes broken definitions)
+    final_elements = []
+    for elem_type, elem_text in formatted_elements:
+        if elem_type == "paragraph" and final_elements and final_elements[-1][0] == "paragraph":
+            prev_text = final_elements[-1][1]
+            if not prev_text.endswith((".", ":", "?", "!")):
+                final_elements[-1] = ("paragraph", prev_text + " " + elem_text)
+            else:
+                final_elements.append((elem_type, elem_text))
+        else:
+            final_elements.append((elem_type, elem_text))
+
+    return {
+        "num": page_num,
+        "title": title_text,
+        "elements": final_elements,
+        "notes": ""
+    }
+
+
+async def extract_from_pdf(file_bytes, tracker=None):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    total_pages = len(doc)
+    if tracker:
+        tracker.total = total_pages
+
+    slides_data = []
+    for idx, page in enumerate(doc, start=1):
+        if tracker:
+            await tracker.update(idx, detail="Analyzing slide structure...")
+        slide_info = parse_pdf_slide(page, idx)
+        slides_data.append(slide_info)
+
+    if tracker:
+        await tracker.update(total_pages, detail="Structure analyzed!", force=True)
+
+    return slides_data
+
+
+# -------------------------------------------------------------
+# INTELLIGENT PPTX PARSER
 # -------------------------------------------------------------
 async def extract_from_pptx(file_bytes, tracker=None):
     prs = Presentation(io.BytesIO(file_bytes))
@@ -143,7 +265,7 @@ async def extract_from_pptx(file_bytes, tracker=None):
 
     for idx, slide in enumerate(prs.slides, start=1):
         if tracker:
-            await tracker.update(idx, detail="Extracting slide text & notes...")
+            await tracker.update(idx, detail="Extracting slide content...")
 
         title = ""
         if slide.shapes.title and slide.shapes.title.text:
@@ -151,20 +273,38 @@ async def extract_from_pptx(file_bytes, tracker=None):
         else:
             title = f"Topic / Slide {idx}"
 
-        content = []
+        elements = []
         for shape in slide.shapes:
             if shape == slide.shapes.title:
                 continue
+
             if shape.has_text_frame:
                 for p in shape.text_frame.paragraphs:
                     cleaned = clean_text_for_pdf(p.text)
-                    if cleaned and cleaned not in content:
-                        content.append(cleaned)
+                    if not cleaned or re.match(r'^\d{1,3}$', cleaned):
+                        continue
+                    if cleaned.startswith(("-", "*", ">")):
+                        elements.append(("bullet", cleaned.lstrip("-*> \t")))
+                    else:
+                        elements.append(("paragraph", cleaned))
+
             elif shape.has_table:
                 for row in shape.table.rows:
                     row_cells = [clean_text_for_pdf(c.text) for c in row.cells if clean_text_for_pdf(c.text)]
                     if row_cells:
-                        content.append(" | ".join(row_cells))
+                        elements.append(("bullet", " : ".join(row_cells)))
+
+        # Stitch paragraphs
+        stitched_elements = []
+        for elem_type, elem_text in elements:
+            if elem_type == "paragraph" and stitched_elements and stitched_elements[-1][0] == "paragraph":
+                prev_text = stitched_elements[-1][1]
+                if not prev_text.endswith((".", ":", "?", "!")):
+                    stitched_elements[-1] = ("paragraph", prev_text + " " + elem_text)
+                else:
+                    stitched_elements.append((elem_type, elem_text))
+            else:
+                stitched_elements.append((elem_type, elem_text))
 
         notes = ""
         if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
@@ -173,7 +313,7 @@ async def extract_from_pptx(file_bytes, tracker=None):
         slides_data.append({
             "num": idx,
             "title": title,
-            "content": content,
+            "elements": stitched_elements,
             "notes": notes,
         })
 
@@ -183,46 +323,14 @@ async def extract_from_pptx(file_bytes, tracker=None):
     return slides_data
 
 
-async def extract_from_pdf(file_bytes, tracker=None):
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    total_pages = len(doc)
-    if tracker:
-        tracker.total = total_pages
-
-    slides_data = []
-
-    for idx, page in enumerate(doc, start=1):
-        if tracker:
-            await tracker.update(idx, detail="Reading slide text...")
-
-        text = page.get_text("text").strip()
-        raw_lines = [clean_text_for_pdf(line) for line in text.split("\n") if clean_text_for_pdf(line)]
-
-        title = raw_lines[0] if raw_lines else f"Slide {idx}"
-        content = raw_lines[1:] if len(raw_lines) > 1 else []
-
-        slides_data.append({
-            "num": idx,
-            "title": title,
-            "content": content,
-            "notes": "",
-        })
-
-    if tracker:
-        await tracker.update(total_pages, detail="Slide reading complete!", force=True)
-
-    return slides_data
-
-
 # -------------------------------------------------------------
-# BLACK & WHITE PDF BUILDER
+# BLACK & WHITE STUDY NOTES GENERATOR
 # -------------------------------------------------------------
 class BWNotesPDF(FPDF):
     def header(self):
         self.set_x(self.l_margin)
         self.set_font("Helvetica", "B", 9)
         self.set_text_color(100, 100, 100)
-        # Safe ASCII header without non-standard bullets
         self.cell(self.epw, 6, clean_text_for_pdf(f"Study Notes | {BRAND_NAME}"), border=0, align="R")
         self.ln(8)
 
@@ -244,13 +352,13 @@ def safe_write_paragraph(pdf, text, font_size=10, is_bold=False, is_italic=False
     pdf.set_x(pdf.l_margin)
 
     full_text = clean_text_for_pdf(f"{prefix}{text}")
-    line_height = max(4.5, font_size * 0.45)
+    line_height = max(4.5, font_size * 0.48)
 
     try:
         pdf.multi_cell(w=pdf.epw, h=line_height, text=full_text)
         pdf.ln(1)
     except Exception as e:
-        logger.warning(f"Line write issue: {e}")
+        logger.warning(f"Writing fallback: {e}")
         pdf.set_x(pdf.l_margin)
         pdf.multi_cell(w=pdf.epw, h=line_height, text=full_text[:80])
         pdf.ln(1)
@@ -262,25 +370,30 @@ def create_bw_text_pdf(slides_data):
     pdf.add_page()
 
     for item in slides_data:
-        if not item["title"] and not item["content"] and not item["notes"]:
+        if not item["title"] and not item["elements"] and not item["notes"]:
             continue
 
+        # Clean section divider
         pdf.set_draw_color(220, 220, 220)
         pdf.set_x(pdf.l_margin)
         pdf.line(pdf.l_margin, pdf.get_y(), pdf.l_margin + pdf.epw, pdf.get_y())
         pdf.ln(3)
 
-        # Dynamic title scaling
+        # Dynamic Title
         title_len = len(item["title"])
         title_font_size = 9 if title_len > 90 else (10.5 if title_len > 45 else 12)
-
         safe_write_paragraph(pdf, text=item["title"], font_size=title_font_size, is_bold=True, color=(0, 0, 0), prefix=f"[{item['num']}] ")
 
-        if item["content"]:
-            for bullet in item["content"]:
-                # Using ASCII dash '-' instead of unicode bullet '•'
-                safe_write_paragraph(pdf, text=bullet, font_size=9.5, is_bold=False, color=(35, 35, 35), prefix="- ")
+        # Elements (Paragraphs & Bullets/Timelines)
+        for elem_type, elem_text in item["elements"]:
+            if elem_type == "paragraph":
+                # Continuous definition / normal text (no bullet prefix)
+                safe_write_paragraph(pdf, text=elem_text, font_size=9.5, is_bold=False, color=(20, 20, 20), prefix="   ")
+            elif elem_type == "bullet":
+                # Timeline or bullet item
+                safe_write_paragraph(pdf, text=elem_text, font_size=9.5, is_bold=False, color=(35, 35, 35), prefix="- ")
 
+        # Presenter Notes
         if item["notes"]:
             safe_write_paragraph(pdf, text=item["notes"], font_size=8.5, is_italic=True, color=(80, 80, 80), prefix="Presenter Notes: ")
 
@@ -290,7 +403,7 @@ def create_bw_text_pdf(slides_data):
 
 
 async def convert_image_pdf_to_bw(file_bytes, tracker=None):
-    """Fallback: Generates lightweight compressed B&W JPEG pages (< 5MB)."""
+    """Fallback for scanned/image decks with low file size."""
     src_doc = fitz.open(stream=file_bytes, filetype="pdf")
     out_doc = fitz.open()
     total_pages = len(src_doc)
@@ -301,7 +414,6 @@ async def convert_image_pdf_to_bw(file_bytes, tracker=None):
         if tracker:
             await tracker.update(idx, detail="Rendering compressed B&W page...")
 
-        # 96 DPI JPEG grayscale compression keeps the file under 5MB
         pix = page.get_pixmap(colorspace=fitz.csGRAY, dpi=96)
         img_bytes = pix.tobytes("jpeg", jpg_quality=60)
         rect = page.rect
@@ -311,7 +423,6 @@ async def convert_image_pdf_to_bw(file_bytes, tracker=None):
     if tracker:
         await tracker.update(total_pages, detail="Rendering complete!", force=True)
 
-    # Deflate compresses the internal PDF structure
     return out_doc.tobytes(garbage=4, deflate=True)
 
 
@@ -322,13 +433,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         f"👋 **Welcome to {BRAND_NAME}!**\n\n"
         "📄 Send me any **PPTX** or **PDF presentation**, and I will instantly convert it into a "
-        "**clean, ink-saving Black & White study notes PDF**!\n\n"
-        "✨ **Features:**\n"
-        "• Real-time conversion Progress Bar 📊\n"
-        "• Strips dark background colors & images\n"
-        "• Automatically fits headlines & bullet points\n"
-        "• Extracts slide text, tables & presenter notes\n\n"
-        "🚀 **Send your file now to get started!**"
+        "**clean, structured Black & White study notes PDF**!\n\n"
+        "✨ **Smart Features:**\n"
+        "• Stitches definitions into readable paragraphs 📖\n"
+        "• Aligns timelines & key-value pairs (`Year : Event`) ⏳\n"
+        "• Removes slide numbers & background noise 🧼\n"
+        "• Live real-time conversion progress bar 📊\n\n"
+        "🚀 **Send your file to start!**"
     )
     await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
@@ -355,20 +466,20 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_bytes = bytes(raw_bytes)
 
         output_pdf_bytes = None
-        tracker = ProgressTracker(status_msg=status_msg, total_items=10, stage_name="Converting Slides")
+        tracker = ProgressTracker(status_msg=status_msg, total_items=10, stage_name="Processing Slides")
 
         if file_ext == "pptx":
             slides_data = await extract_from_pptx(file_bytes, tracker=tracker)
             output_pdf_bytes = create_bw_text_pdf(slides_data)
         else:
             slides_data = await extract_from_pdf(file_bytes, tracker=tracker)
-            total_text_len = sum(len(s["title"]) + sum(len(c) for c in s["content"]) for s in slides_data)
+            total_elements = sum(len(s["elements"]) for s in slides_data)
 
-            if total_text_len > 30:
+            if total_elements > 0:
                 try:
                     output_pdf_bytes = create_bw_text_pdf(slides_data)
                 except Exception as text_err:
-                    logger.warning(f"Text layout failed, switching to compressed image fallback: {text_err}")
+                    logger.warning(f"Text layout error: {text_err}. Switching to visual fallback.")
                     tracker.stage_name = "Rendering Grayscale Slides"
                     output_pdf_bytes = await convert_image_pdf_to_bw(file_bytes, tracker=tracker)
             else:
@@ -379,7 +490,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await status_msg.edit_text(
                 f"⚡ **{BRAND_NAME}**\n\n"
                 "`[██████████] 100%`\n"
-                "📤 **Finalizing and sending your notes...**",
+                "📤 **Finalizing and sending your study notes...**",
                 parse_mode="Markdown"
             )
         except Exception:
@@ -391,7 +502,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=io.BytesIO(output_pdf_bytes),
             filename=output_filename,
-            caption=f"✅ **Converted successfully by {BRAND_NAME}!**\n📄 Clean Black & White Study Notes.",
+            caption=f"✅ **Converted successfully by {BRAND_NAME}!**\n📄 Clean & Structured Black & White Study Notes.",
             parse_mode="Markdown",
         )
         await status_msg.delete()
@@ -417,7 +528,7 @@ def main():
     app.add_handler(CommandHandler("help", start_command))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    logger.info(f"{BRAND_NAME} is active and listening...")
+    logger.info(f"{BRAND_NAME} is active and running...")
     app.run_polling()
 
 
