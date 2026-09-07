@@ -2,3 +2,5 @@ python-telegram-bot>=20.7
 python-pptx>=0.6.23
 pymupdf>=1.23.0
 fpdf2>=2.7.7
+google-generativeai>=0.8.0
+pillow>=10.0.0
